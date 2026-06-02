@@ -27,10 +27,12 @@ def extract_start_timestamp(mzml_file: Path) -> str | None:
     return None
 
 
-def timestamp_to_prefix(ts: str) -> str:
+def get_timestamp_str(ts: str, position: str = "prefix") -> str:
     """
-    Convert an ISO-8601 timestamp such as '2025-04-21T03:53:19' to a file-name
-    prefix of the form 'YYYY_MM_DD_HH_MM__'.
+    Convert an ISO-8601 timestamp such as '2025-04-21T03:53:19' to a string
+    like '2025_04_21_03_53'.
+    If position is 'prefix', returns 'YYYY_MM_DD_HH_MM__'.
+    If position is 'suffix', returns '__YYYY_MM_DD_HH_MM'.
     """
     # Accept both 'T' and ' ' as date/time separator; strip timezone suffix.
     ts_clean = ts.strip().replace(" ", "T")
@@ -38,16 +40,20 @@ def timestamp_to_prefix(ts: str) -> str:
         from datetime import datetime
 
         dt = datetime.fromisoformat(ts_clean)
-        return dt.strftime("%Y_%m_%d_%H_%M__")
+        ts_str = dt.strftime("%Y_%m_%d_%H_%M")
     except ValueError:
         # Fallback: replace separators manually
         safe = ts_clean.replace(":", "_").replace("T", "_").replace("-", "_")
-        return safe[:16].rstrip("_") + "__"
+        ts_str = safe[:16].rstrip("_")
+
+    if position == "prefix":
+        return ts_str + "__"
+    return "__" + ts_str
 
 
-def prefix_mzml_with_timestamp(mzml_file: Path, log: list[str] | None = None) -> Path | None:
+def rename_mzml_with_timestamp(mzml_file: Path, position: str = "prefix", log: list[str] | None = None) -> Path | None:
     """
-    Rename *mzml_file* by prepending its acquisition timestamp.
+    Rename *mzml_file* by prepending or appending its acquisition timestamp.
     Returns the new Path on success, or None if the timestamp could not be found.
     Appends messages to *log* (or prints directly when *log* is None).
     """
@@ -63,8 +69,12 @@ def prefix_mzml_with_timestamp(mzml_file: Path, log: list[str] | None = None) ->
         _log(f"  WARNING: No startTimeStamp found in '{mzml_file.name}', skipping rename.")
         return None
 
-    prefix = timestamp_to_prefix(ts)
-    new_name = prefix + mzml_file.name
+    ts_str = get_timestamp_str(ts, position)
+    if position == "prefix":
+        new_name = ts_str + mzml_file.name
+    else:
+        new_name = mzml_file.stem + ts_str + mzml_file.suffix
+
     new_path = mzml_file.parent / new_name
 
     if new_path.exists():

@@ -13,7 +13,7 @@ import toml
 
 from .filterMZML import MzmlFilter, apply_mzml_filter  # noqa: E402
 from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
-from .prefixTimestamp import prefix_mzml_with_timestamp  # noqa: E402
+from .prefixTimestamp import rename_mzml_with_timestamp  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -254,7 +254,7 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
     label: str = job["label"]
     thermoconvert: Path = job["thermoconvert"]
     msconvert: Path = job["msconvert"]
-    add_timestamp_prefix: bool = job.get("add_timestamp_prefix", False)
+    timestamp_mode: str | None = job.get("timestamp_mode", None)
     mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
 
     log: list[str] = []
@@ -276,8 +276,8 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
     if do_fix:
         mzml_file = fix_msms(mzml_file, newext, ppm_dev, log=log)
 
-    if add_timestamp_prefix:
-        new_path = prefix_mzml_with_timestamp(mzml_file, log=log)
+    if timestamp_mode in ("prefix", "suffix"):
+        new_path = rename_mzml_with_timestamp(mzml_file, position=timestamp_mode, log=log)
         if new_path:
             mzml_file = new_path
 
@@ -310,7 +310,7 @@ def build_jobs(
     ppm_dev: float,
     thermoconvert: Path,
     msconvert: Path,
-    add_timestamp_prefix: bool,
+    timestamp_mode: str | None = None,
     mzml_filter: MzmlFilter | None = None,
 ) -> list[dict]:
     jobs: list[dict] = []
@@ -320,7 +320,7 @@ def build_jobs(
         ppm_dev=ppm_dev,
         thermoconvert=thermoconvert,
         msconvert=msconvert,
-        add_timestamp_prefix=add_timestamp_prefix,
+        timestamp_mode=timestamp_mode,
         mzml_filter=mzml_filter or MzmlFilter(),
     )
 
@@ -377,7 +377,7 @@ def run_conversion(
     n_threads: int,
     thermo_version_idx: int,
     msconvert_version_idx: int,
-    add_timestamp_prefix: bool,
+    timestamp_mode: str | None = None,
     mzml_filter: MzmlFilter | None = None,
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -425,7 +425,7 @@ def run_conversion(
         ppm_dev=ppm_dev,
         thermoconvert=thermoconvert,
         msconvert=msconvert,
-        add_timestamp_prefix=add_timestamp_prefix,
+        timestamp_mode=timestamp_mode,
         mzml_filter=mzml_filter,
     )
 

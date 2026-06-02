@@ -369,10 +369,14 @@ class ConvertRawApp(App):
             yield Rule()
 
             # ----------------------------------------------------------------
-            # Timestamp prefix
+            # Timestamp suffix / prefix
             # ----------------------------------------------------------------
             yield Static("🕐  File Naming", classes="section-title")
-            yield Checkbox("Prefix output file names with acquisition timestamp  (YYYY_MM_DD_HH_MM__)", id="cb-timestamp", value=False)
+            yield Static("Add acquisition timestamp (YYYY_MM_DD_HH_MM) to name:", classes="hint")
+            with RadioSet(id="rs-timestamp"):
+                yield RadioButton("No timestamp  [default]", value=True, id="rb-ts-no")
+                yield RadioButton("As prefix:  [bold]YYYY_MM_DD_HH_MM__[/bold]filename.mzML", id="rb-ts-prefix")
+                yield RadioButton("As suffix:  filename[bold]__YYYY_MM_DD_HH_MM[/bold].mzML", id="rb-ts-suffix")
             yield Rule()
 
             # ----------------------------------------------------------------
@@ -630,7 +634,12 @@ class ConvertRawApp(App):
         newext_raw = self.query_one("#inp-newext", Input).value.strip()
         newext = newext_raw if newext_raw else "::SAME"
 
-        add_timestamp = self.query_one("#cb-timestamp", Checkbox).value
+        ts_idx = self._selected_index("rs-timestamp")
+        timestamp_mode: str | None = None
+        if ts_idx == 1:
+            timestamp_mode = "prefix"
+        elif ts_idx == 2:
+            timestamp_mode = "suffix"
 
         # --- Spectrum filters ---
         pol_idx = self._selected_index("rs-filter-polarity")
@@ -727,7 +736,7 @@ class ConvertRawApp(App):
                 n_threads=n_threads,
                 thermo_version_idx=thermo_ver_idx,
                 msconvert_version_idx=msconvert_ver_idx,
-                add_timestamp_prefix=add_timestamp,
+                timestamp_mode=timestamp_mode,
                 mzml_filter=mzml_filter,
                 log_callback=self._log,
                 progress_callback=self._update_progress,
