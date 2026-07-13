@@ -18,7 +18,7 @@ that of 'isolation window target m/z'.
      +- raw-filen.raw
      +- folder
           +- raw-filex.raw
-     +- util_convertRAW
+     +- convert2RAW
           +- run.bat
 ```
 

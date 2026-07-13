@@ -263,7 +263,7 @@ Input:focus {
 """
 
 
-class ConvertRawApp(App):
+class Convert2RawApp(App):
     """Single-page TUI for the RAW → mzML conversion pipeline."""
 
     TITLE = f"Thermo Raw File Converter  v{get_version()}"

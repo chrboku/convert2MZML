@@ -26,5 +26,5 @@ exit /b 0
 
 :uv_found
 
-uv run convertraw
+uv run convert2raw
 pause

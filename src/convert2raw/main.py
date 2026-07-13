@@ -477,9 +477,9 @@ def get_version() -> str:
 
 
 def main() -> None:
-    from .tui import ConvertRawApp
+    from .tui import Convert2RawApp
 
-    app = ConvertRawApp()
+    app = Convert2RawApp()
     app.run()
 
 
