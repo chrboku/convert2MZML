@@ -11,7 +11,7 @@ from pathlib import Path
 
 import toml
 
-from .filterMZML import MzmlFilter, apply_mzml_filter  # noqa: E402
+from .filterMZML import MzmlFilter, apply_mzml_filter, get_spectrum_polarities  # noqa: E402
 from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
 from .prefixTimestamp import rename_mzml_with_timestamp  # noqa: E402
 
@@ -187,6 +187,14 @@ def output_dir_for(raw_file: Path, source_folder: Path, output_base: Path, mode_
     return output_base / mode_subdir / rel_parent
 
 
+def _mode_dir_for(job: dict, mode_subdir: str) -> Path:
+    output_folder: Path = job["output_folder"]
+    raw_data_folder: Path = job["raw_data_folder"]
+    raw_file: Path = job["raw_file"]
+    rel_parent = raw_file.relative_to(raw_data_folder).parent
+    return output_folder / mode_subdir / rel_parent
+
+
 def convert_thermo(raw_file: Path, out_dir: Path, thermoconvert: Path, log: list[str] | None = None) -> None:
     ensure_dir(out_dir)
     cmd = [str(thermoconvert), "-f", "1", "-a", "-e", "-x", "-i", str(raw_file), "-o", str(out_dir)]
@@ -284,6 +292,43 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
     if mzml_filter.is_active():
         apply_mzml_filter(mzml_file, mzml_filter, log=log)
 
+    polarities = get_spectrum_polarities(mzml_file)
+    if polarities == {"positive"}:
+        target_dir = _mode_dir_for(job, "Pos")
+        ensure_dir(target_dir)
+        target_file = target_dir / mzml_file.name
+        shutil.move(str(mzml_file), str(target_file))
+        mzml_file = target_file
+        _emit(f"  Routed to Pos folder: {mzml_file.name}")
+    elif polarities == {"negative"}:
+        target_dir = _mode_dir_for(job, "Neg")
+        ensure_dir(target_dir)
+        target_file = target_dir / mzml_file.name
+        shutil.move(str(mzml_file), str(target_file))
+        mzml_file = target_file
+        _emit(f"  Routed to Neg folder: {mzml_file.name}")
+    elif polarities == {"positive", "negative"}:
+        fps_dir = _mode_dir_for(job, "FPS")
+        ensure_dir(fps_dir)
+        if mzml_file.parent != fps_dir:
+            target_file = fps_dir / mzml_file.name
+            shutil.move(str(mzml_file), str(target_file))
+            mzml_file = target_file
+        pos_dir = _mode_dir_for(job, "Pos")
+        neg_dir = _mode_dir_for(job, "Neg")
+        ensure_dir(pos_dir)
+        ensure_dir(neg_dir)
+
+        pos_file = pos_dir / mzml_file.name
+        neg_file = neg_dir / mzml_file.name
+        shutil.copy2(mzml_file, pos_file)
+        shutil.copy2(mzml_file, neg_file)
+        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
+        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
+        _emit(f"  Split mixed-polarity file into FPS, Pos, and Neg folders: {mzml_file.name}")
+    else:
+        _emit("  WARNING: No polarity markers found after filtering; keeping FPS output.")
+
     _emit(f"[{label}] DONE:  {raw_file.name}")
 
     if not log_callback:
@@ -302,9 +347,6 @@ def build_jobs(
     raw_data_folder: Path,
     output_folder: Path,
     converter: str,
-    exp_fps: bool,
-    exp_pos: bool,
-    exp_neg: bool,
     do_fix: bool,
     newext: str,
     ppm_dev: float,
@@ -322,24 +364,13 @@ def build_jobs(
         msconvert=msconvert,
         timestamp_mode=timestamp_mode,
         mzml_filter=mzml_filter or MzmlFilter(),
+        raw_data_folder=raw_data_folder,
+        output_folder=output_folder,
     )
 
-    if converter == "thermo":
-        for raw_file in raw_files:
-            out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
-            jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter="thermo", polarity_filter=None, label="FPS", **common))
-    else:
-        modes: list[tuple[str, str | None]] = []
-        if exp_fps:
-            modes.append(("FPS", None))
-        if exp_pos:
-            modes.append(("pos", "positive"))
-        if exp_neg:
-            modes.append(("neg", "negative"))
-        for mode_dir, polarity in modes:
-            for raw_file in raw_files:
-                out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, mode_dir)
-                jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter="msconvert", polarity_filter=polarity, label=mode_dir, **common))
+    for raw_file in raw_files:
+        out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
+        jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter=converter, polarity_filter=None, label="FPS", **common))
 
     return jobs
 
@@ -353,7 +384,38 @@ def filter_existing_jobs(jobs: list[dict]) -> tuple[list[dict], int]:
             return job["out_dir"] / (stem + job["newext"] + ".mzML")
         return job["out_dir"] / (stem + ".mzML")
 
-    remaining = [j for j in jobs if not _output_mzml(j).exists()]
+    def _job_complete(job: dict) -> bool:
+        primary_file = _output_mzml(job)
+        output_folder: Path = job["output_folder"]
+        raw_data_folder: Path = job["raw_data_folder"]
+        rel_parent = job["raw_file"].relative_to(raw_data_folder).parent
+        secondary_name = primary_file.name
+        fps_file = primary_file
+        if fps_file.exists():
+            polarities = get_spectrum_polarities(fps_file)
+            pos_file = output_folder / "Pos" / rel_parent / secondary_name
+            neg_file = output_folder / "Neg" / rel_parent / secondary_name
+            if polarities == {"positive", "negative"}:
+                return pos_file.exists() and neg_file.exists()
+            if polarities == {"positive"}:
+                return pos_file.exists()
+            if polarities == {"negative"}:
+                return neg_file.exists()
+            return True
+
+        pos_file = output_folder / "Pos" / rel_parent / secondary_name
+        neg_file = output_folder / "Neg" / rel_parent / secondary_name
+        if pos_file.exists():
+            if neg_file.exists():
+                return False
+            return get_spectrum_polarities(pos_file) == {"positive"}
+        if neg_file.exists():
+            if pos_file.exists():
+                return False
+            return get_spectrum_polarities(neg_file) == {"negative"}
+        return False
+
+    remaining = [j for j in jobs if not _job_complete(j)]
     return remaining, len(jobs) - len(remaining)
 
 
@@ -367,9 +429,6 @@ def run_conversion(
     output_folder: Path,
     recursive: bool,
     converter: str,
-    exp_fps: bool,
-    exp_pos: bool,
-    exp_neg: bool,
     do_fix: bool,
     newext: str,
     ppm_dev: float,
@@ -417,9 +476,6 @@ def run_conversion(
         raw_data_folder=raw_data_folder,
         output_folder=output_folder,
         converter=converter,
-        exp_fps=exp_fps,
-        exp_pos=exp_pos,
-        exp_neg=exp_neg,
         do_fix=do_fix,
         newext=newext,
         ppm_dev=ppm_dev,

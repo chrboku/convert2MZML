@@ -196,3 +196,22 @@ def apply_mzml_filter(mzml_file: Path, f: MzmlFilter, log: list[str] | None = No
                 soup.prettify().replace("\r", ""),
             )
         )
+
+
+def get_spectrum_polarities(mzml_file: Path) -> set[str]:
+    """Return the set of scan polarities present in *mzml_file*."""
+    with open(mzml_file, "r", encoding="utf-8") as fh:
+        data = fh.read()
+
+    soup = bs4.BeautifulSoup(data, "xml")
+    spectrum_list = soup.find("spectrumList")
+    if spectrum_list is None:
+        return set()
+
+    polarities: set[str] = set()
+    for spectrum in spectrum_list.find_all("spectrum", recursive=False):
+        if spectrum.find("cvParam", {"accession": _CV_POSITIVE_SCAN}):
+            polarities.add("positive")
+        if spectrum.find("cvParam", {"accession": _CV_NEGATIVE_SCAN}):
+            polarities.add("negative")
+    return polarities

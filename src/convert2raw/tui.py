@@ -339,16 +339,6 @@ class Convert2RawApp(App):
             yield Rule()
 
             # ----------------------------------------------------------------
-            # MSConvert export modes (hidden when ThermoRawFileParser selected)
-            # ----------------------------------------------------------------
-            with Vertical(id="panel-export-modes"):
-                yield Static("📤  MSConvert Export Modes", classes="section-title")
-                yield Checkbox("Export FPS data (all scans)", id="cb-fps", value=True)
-                yield Checkbox("Export positive mode", id="cb-pos", value=False)
-                yield Checkbox("Export negative mode", id="cb-neg", value=False)
-                yield Rule()
-
-            # ----------------------------------------------------------------
             # MSMS correction
             # ----------------------------------------------------------------
             yield Static("🔬  MSMS Precursor Correction", classes="section-title")
@@ -387,12 +377,6 @@ class Convert2RawApp(App):
                 "Applied after conversion. All active criteria are combined with AND logic. Spectra that do not satisfy all active criteria are removed from the output mzML.",
                 classes="hint",
             )
-
-            yield Static("Scan polarity (applies to all MS levels):", classes="hint")
-            with RadioSet(id="rs-filter-polarity"):
-                yield RadioButton("All polarities  [default]", value=True, id="rb-filter-pol-all")
-                yield RadioButton("Positive scans only", id="rb-filter-pol-pos")
-                yield RadioButton("Negative scans only", id="rb-filter-pol-neg")
 
             yield Static("MS levels to keep (unchecked = keep all):", classes="hint")
             yield Checkbox("Keep MS1 scans", id="cb-filter-ms1", value=False)
@@ -488,7 +472,6 @@ class Convert2RawApp(App):
     def _apply_converter_visibility(self, is_thermo: bool) -> None:
         self.query_one("#panel-thermo-ver").display = is_thermo
         self.query_one("#panel-msconvert-ver").display = not is_thermo
-        self.query_one("#panel-export-modes").display = not is_thermo
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -625,10 +608,6 @@ class Convert2RawApp(App):
         thermo_ver_idx = self._selected_index("rs-thermo-ver")
         msconvert_ver_idx = self._selected_index("rs-msconvert-ver")
 
-        exp_fps = self.query_one("#cb-fps", Checkbox).value
-        exp_pos = self.query_one("#cb-pos", Checkbox).value
-        exp_neg = self.query_one("#cb-neg", Checkbox).value
-
         do_fix = (self._selected_index("rs-fix")) == 0
 
         newext_raw = self.query_one("#inp-newext", Input).value.strip()
@@ -642,13 +621,6 @@ class Convert2RawApp(App):
             timestamp_mode = "suffix"
 
         # --- Spectrum filters ---
-        pol_idx = self._selected_index("rs-filter-polarity")
-        filter_polarity: str | None = None
-        if pol_idx == 1:
-            filter_polarity = "positive"
-        elif pol_idx == 2:
-            filter_polarity = "negative"
-
         filter_ms_levels: set[int] = set()
         if self.query_one("#cb-filter-ms1", Checkbox).value:
             filter_ms_levels.add(1)
@@ -683,7 +655,6 @@ class Convert2RawApp(App):
         filter_string_regex: str | None = filter_regex_raw if filter_regex_raw else None
 
         mzml_filter = MzmlFilter(
-            polarity=filter_polarity,
             ms_levels=filter_ms_levels,
             ce_min=filter_ce_min,
             ce_max=filter_ce_max,
@@ -726,9 +697,6 @@ class Convert2RawApp(App):
                 output_folder=output_folder,
                 recursive=recursive,
                 converter=converter,
-                exp_fps=exp_fps,
-                exp_pos=exp_pos,
-                exp_neg=exp_neg,
                 do_fix=do_fix,
                 newext=newext,
                 ppm_dev=1.0,
