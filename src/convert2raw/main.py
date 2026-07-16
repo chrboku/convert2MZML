@@ -7,7 +7,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import urllib.request
 import zipfile
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import toml
@@ -337,6 +336,7 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
             for line in log:
                 print(line)
 
+
 def process_job_worker(job: dict) -> list[str]:
     """
     Worker version of process_job suitable for running in a separate process.
@@ -420,6 +420,7 @@ def process_job_worker(job: dict) -> list[str]:
     _emit(f"[{label}] DONE:  {raw_file.name}")
 
     return log
+
 
 # ---------------------------------------------------------------------------
 # Build job list
@@ -587,7 +588,11 @@ def run_conversion(
     with ProcessPoolExecutor(max_workers=n_threads) as executor:
         futures = {executor.submit(process_job_worker, job): job for job in jobs}
         for future in as_completed(futures):
-            logs = future.result()
+            job = futures[future]
+            try:
+                logs = future.result()
+            except Exception as exc:
+                logs = [f"  ERROR: Job for '{job['raw_file'].name}' failed: {exc}"]
             with lock:
                 completed_count += 1
                 done = completed_count

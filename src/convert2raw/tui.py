@@ -692,22 +692,25 @@ class Convert2RawApp(App):
         label.update("Converting…")
 
         def _do_convert() -> None:
-            run_conversion(
-                raw_data_folder=raw_data_folder,
-                output_folder=output_folder,
-                recursive=recursive,
-                converter=converter,
-                do_fix=do_fix,
-                newext=newext,
-                ppm_dev=1.0,
-                skip_existing=skip_existing,
-                n_threads=n_threads,
-                thermo_version_idx=thermo_ver_idx,
-                msconvert_version_idx=msconvert_ver_idx,
-                timestamp_mode=timestamp_mode,
-                mzml_filter=mzml_filter,
-                log_callback=self._log,
-                progress_callback=self._update_progress,
-            )
+            try:
+                run_conversion(
+                    raw_data_folder=raw_data_folder,
+                    output_folder=output_folder,
+                    recursive=recursive,
+                    converter=converter,
+                    do_fix=do_fix,
+                    newext=newext,
+                    ppm_dev=1.0,
+                    skip_existing=skip_existing,
+                    n_threads=n_threads,
+                    thermo_version_idx=thermo_ver_idx,
+                    msconvert_version_idx=msconvert_ver_idx,
+                    timestamp_mode=timestamp_mode,
+                    mzml_filter=mzml_filter,
+                    log_callback=self._log,
+                    progress_callback=self._update_progress,
+                )
+            except Exception as exc:
+                self._log(f"[red]ERROR: Conversion failed: {exc}[/red]")
 
         threading.Thread(target=_do_convert, daemon=True).start()
