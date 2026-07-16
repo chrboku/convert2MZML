@@ -3,6 +3,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -70,7 +71,7 @@ MSCONVERT_VERSIONS: list[dict] = [
 ]
 
 
-def get_tool_paths(thermo_idx: int = 0, msconvert_idx: int = 0) -> tuple[Path, Path]:
+def get_tool_paths(thermo_idx: int = 2, msconvert_idx: int = 0) -> tuple[Path, Path]:
     """Return (thermoconvert_exe, msconvert_exe) for the given version indices."""
     t = THERMOCONVERT_VERSIONS[thermo_idx]
     m = MSCONVERT_VERSIONS[msconvert_idx]
@@ -336,6 +337,89 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
             for line in log:
                 print(line)
 
+def process_job_worker(job: dict) -> list[str]:
+    """
+    Worker version of process_job suitable for running in a separate process.
+    Returns a list of log lines produced while processing the job.
+    """
+    raw_file: Path = job["raw_file"]
+    out_dir: Path = job["out_dir"]
+    converter: str = job["converter"]
+    polarity_filter: str | None = job.get("polarity_filter")
+    do_fix: bool = job["fix"]
+    newext: str = job["newext"]
+    ppm_dev: float = job["ppm_dev"]
+    label: str = job["label"]
+    thermoconvert: Path = job["thermoconvert"]
+    msconvert: Path = job["msconvert"]
+    timestamp_mode: str | None = job.get("timestamp_mode", None)
+    mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
+
+    log: list[str] = []
+
+    def _emit(msg: str) -> None:
+        log.append(msg)
+
+    _emit(f"[{label}] START: {raw_file.name}")
+
+    if converter == "thermo":
+        convert_thermo(raw_file, out_dir, thermoconvert, log=log)
+    else:
+        convert_msconvert(raw_file, out_dir, msconvert, polarity_filter=polarity_filter, log=log)
+
+    mzml_file = out_dir / (raw_file.stem + ".mzML")
+
+    if do_fix:
+        mzml_file = fix_msms(mzml_file, newext, ppm_dev, log=log)
+
+    if timestamp_mode in ("prefix", "suffix"):
+        new_path = rename_mzml_with_timestamp(mzml_file, position=timestamp_mode, log=log)
+        if new_path:
+            mzml_file = new_path
+
+    if mzml_filter.is_active():
+        apply_mzml_filter(mzml_file, mzml_filter, log=log)
+
+    polarities = get_spectrum_polarities(mzml_file)
+    if polarities == {"positive"}:
+        target_dir = _mode_dir_for(job, "Pos")
+        ensure_dir(target_dir)
+        target_file = target_dir / mzml_file.name
+        shutil.move(str(mzml_file), str(target_file))
+        mzml_file = target_file
+        _emit(f"  Routed to Pos folder: {mzml_file.name}")
+    elif polarities == {"negative"}:
+        target_dir = _mode_dir_for(job, "Neg")
+        ensure_dir(target_dir)
+        target_file = target_dir / mzml_file.name
+        shutil.move(str(mzml_file), str(target_file))
+        mzml_file = target_file
+        _emit(f"  Routed to Neg folder: {mzml_file.name}")
+    elif polarities == {"positive", "negative"}:
+        fps_dir = _mode_dir_for(job, "FPS")
+        ensure_dir(fps_dir)
+        if mzml_file.parent != fps_dir:
+            target_file = fps_dir / mzml_file.name
+            shutil.move(str(mzml_file), str(target_file))
+            mzml_file = target_file
+        pos_dir = _mode_dir_for(job, "Pos")
+        neg_dir = _mode_dir_for(job, "Neg")
+        ensure_dir(pos_dir)
+        ensure_dir(neg_dir)
+
+        pos_file = pos_dir / mzml_file.name
+        neg_file = neg_dir / mzml_file.name
+        shutil.copy2(mzml_file, pos_file)
+        shutil.copy2(mzml_file, neg_file)
+        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
+        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
+        _emit(f"  Split mixed-polarity file into FPS, Pos, and Neg folders: {mzml_file.name}")
+    else:
+        _emit("  WARNING: No polarity markers found after filtering; keeping FPS output.")
+
+    _emit(f"[{label}] DONE:  {raw_file.name}")
+
+    return log
 
 # ---------------------------------------------------------------------------
 # Build job list
@@ -494,23 +578,29 @@ def run_conversion(
         _log("No files to process.")
         return
 
-    _log(f"Processing {len(jobs)} job(s) with {n_threads} thread(s)...")
+    _log(f"Processing {len(jobs)} job(s) with {n_threads} process(es)...")
 
     total = len(jobs)
-    completed_count = [0]
+    completed_count = 0
     lock = threading.Lock()
 
-    def _run_job(job: dict) -> None:
-        process_job(job, log_callback=log_callback)
-        with lock:
-            completed_count[0] += 1
-            done = completed_count[0]
-            _log(f"Progress: {done}/{total} done")
-            if progress_callback:
-                progress_callback(done, total)
-
-    with ThreadPoolExecutor(max_workers=n_threads) as executor:
-        executor.map(_run_job, jobs)
+    with ProcessPoolExecutor(max_workers=n_threads) as executor:
+        futures = {executor.submit(process_job_worker, job): job for job in jobs}
+        for future in as_completed(futures):
+            logs = future.result()
+            with lock:
+                completed_count += 1
+                done = completed_count
+                if log_callback:
+                    for line in logs:
+                        log_callback(line)
+                else:
+                    with _print_lock:
+                        for line in logs:
+                            print(line)
+                _log(f"Progress: {done}/{total} done")
+                if progress_callback:
+                    progress_callback(done, total)
 
     _log("All done.")
 

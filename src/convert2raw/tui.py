@@ -321,8 +321,8 @@ class Convert2RawApp(App):
                         yield Static("ThermoRawFileParser version:", classes="hint")
                         with RadioSet(id="rs-thermo-ver"):
                             for i, v in enumerate(THERMOCONVERT_VERSIONS):
-                                yield RadioButton(v["label"], value=(i == 0), id=f"rb-thermo-ver-{i}")
-                        yield Static(self._tool_status_text("thermo", 0), id="thermo-status", classes="tool-status")
+                                yield RadioButton(v["label"], value=(i == 1), id=f"rb-thermo-ver-{i}")
+                        yield Static(self._tool_status_text("thermo", 2), id="thermo-status", classes="tool-status")
                         yield Button("Download / Install ThermoRawFileParser", id="btn-download-thermo", variant="default")
                         yield RichLog(id="thermo-log", highlight=True, markup=True, wrap=True, classes="inline-log")
 
