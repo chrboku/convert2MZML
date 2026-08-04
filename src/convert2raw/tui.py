@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from rich.text import Text
@@ -38,7 +39,9 @@ from .main import (
     get_tool_paths,
     get_version,
     install_tool,
+    load_settings,
     run_conversion,
+    save_settings,
 )
 from .filterMZML import MzmlFilter
 
@@ -378,6 +381,8 @@ class Convert2RawApp(App):
             with RadioSet(id="rs-fix"):
                 yield RadioButton("Fix incorrect MSMS precursor m/z  [default]", value=True, id="rb-fix-yes")
                 yield RadioButton("Skip correction", id="rb-fix-no")
+            yield Label("Precursor m/z tolerance for correction (ppm; deviations at or above this are corrected):")
+            yield Input(placeholder="1.0", id="inp-ppm-dev", value="1.0")
             yield Label("Output file suffix for corrected mzML (leave blank to overwrite in-place):")
             yield Input(placeholder="e.g.  _fixed   —  blank = overwrite original", id="inp-newext", value="")
             yield Rule()
@@ -468,10 +473,12 @@ class Convert2RawApp(App):
         self.query_one("#progress-label", Static).display = False
         # Apply initial visibility: ThermoRawFileParser selected by default
         self._apply_converter_visibility(is_thermo=True)
-        # Set up the status-overview table columns (File + one per pipeline step)
+        # Set up the status-overview table columns (File + one per pipeline step + Duration)
         table = self.query_one("#status-table", DataTable)
-        col_keys = table.add_columns("File", *STEPS)
-        self._status_columns: dict[str, object] = dict(zip(["File"] + STEPS, col_keys))
+        col_keys = table.add_columns("File", *STEPS, "Duration")
+        self._status_columns: dict[str, object] = dict(zip(["File"] + STEPS + ["Duration"], col_keys))
+        # Restore last-used settings, if any
+        self._apply_settings(load_settings())
 
     # ------------------------------------------------------------------
     # Helpers
@@ -488,6 +495,21 @@ class Convert2RawApp(App):
         rs = self.query_one(f"#{radioset_id}", RadioSet)
         return rs.pressed_index or 0
 
+    def _call_on_ui_thread(self, fn: Callable, *args: object) -> None:
+        """Run *fn(*args)* safely no matter which thread we're called from.
+
+        These UI-update helpers are invoked both synchronously from the app's
+        own thread (e.g. validation errors in _start_conversion, before any
+        worker thread exists) and from background threads (the conversion
+        thread, its event-draining thread, the scan/download threads).
+        Textual's call_from_thread() raises if called from the app thread
+        itself, so we only use it when we're actually on a different thread.
+        """
+        if threading.get_ident() == self._thread_id:
+            fn(*args)
+        else:
+            self.call_from_thread(fn, *args)
+
     def _update_progress(self, completed: int, total: int) -> None:
         def _apply() -> None:
             bar = self.query_one("#progress-bar", ProgressBar)
@@ -497,11 +519,11 @@ class Convert2RawApp(App):
             if completed >= total:
                 label.update(f"[green]✔ Done — {completed} / {total} file(s) converted[/green]")
 
-        self.call_from_thread(_apply)
+        self._call_on_ui_thread(_apply)
 
     def _log(self, msg: str) -> None:
         log_widget = self.query_one("#log", RichLog)
-        self.call_from_thread(log_widget.write, msg)
+        self._call_on_ui_thread(log_widget.write, msg)
 
     def _status_update(self, file_id: str, step: str, status: str) -> None:
         def _apply() -> None:
@@ -515,11 +537,102 @@ class Convert2RawApp(App):
             except Exception:
                 pass
 
-        self.call_from_thread(_apply)
+        self._call_on_ui_thread(_apply)
 
     def _apply_converter_visibility(self, is_thermo: bool) -> None:
         self.query_one("#panel-thermo-ver").display = is_thermo
         self.query_one("#panel-msconvert-ver").display = not is_thermo
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, secs = divmod(int(round(seconds)), 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _duration_update(self, file_id: str, elapsed: float) -> None:
+        def _apply() -> None:
+            table = self.query_one("#status-table", DataTable)
+            col_key = self._status_columns.get("Duration")
+            if col_key is None:
+                return
+            try:
+                table.update_cell(file_id, col_key, Text(self._format_duration(elapsed), style="cyan"))
+            except Exception:
+                pass
+
+        self._call_on_ui_thread(_apply)
+
+    # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+
+    _SETTINGS_INPUT_IDS = [
+        "inp-source",
+        "inp-output",
+        "inp-ppm-dev",
+        "inp-newext",
+        "inp-ce-min",
+        "inp-ce-max",
+        "inp-ce-values",
+        "inp-filter-regex",
+        "inp-threads",
+    ]
+    _SETTINGS_CHECKBOX_IDS = ["cb-filter-ms1", "cb-filter-ms2"]
+    _SETTINGS_RADIOSET_IDS = [
+        "rs-recursive",
+        "rs-existing",
+        "rs-outmode",
+        "rs-converter",
+        "rs-thermo-ver",
+        "rs-msconvert-ver",
+        "rs-fix",
+        "rs-timestamp",
+    ]
+
+    def _gather_settings(self) -> dict:
+        settings: dict = {}
+        for wid in self._SETTINGS_INPUT_IDS:
+            settings[wid] = self.query_one(f"#{wid}", Input).value
+        for wid in self._SETTINGS_CHECKBOX_IDS:
+            settings[wid] = self.query_one(f"#{wid}", Checkbox).value
+        for wid in self._SETTINGS_RADIOSET_IDS:
+            settings[wid] = self._selected_index(wid)
+        return settings
+
+    def _apply_settings(self, settings: dict) -> None:
+        if not settings:
+            return
+        for wid in self._SETTINGS_INPUT_IDS:
+            if wid not in settings:
+                continue
+            try:
+                self.query_one(f"#{wid}", Input).value = str(settings[wid])
+            except Exception:
+                pass
+        for wid in self._SETTINGS_CHECKBOX_IDS:
+            if wid not in settings:
+                continue
+            try:
+                self.query_one(f"#{wid}", Checkbox).value = bool(settings[wid])
+            except Exception:
+                pass
+        for wid in self._SETTINGS_RADIOSET_IDS:
+            if wid not in settings:
+                continue
+            try:
+                rs = self.query_one(f"#{wid}", RadioSet)
+                idx = int(settings[wid])
+                buttons = list(rs.query(RadioButton))
+                if 0 <= idx < len(buttons):
+                    buttons[idx].value = True
+            except Exception:
+                pass
+        # Converter version panel visibility follows the restored converter choice
+        self._apply_converter_visibility(self._selected_index("rs-converter") == 0)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -561,7 +674,7 @@ class Convert2RawApp(App):
 
     def _scan_log(self, msg: str) -> None:
         scan_log = self.query_one("#scan-log", RichLog)
-        self.call_from_thread(scan_log.write, msg)
+        self._call_on_ui_thread(scan_log.write, msg)
 
     def _scan_source_folder(self) -> None:
         source_str = self.query_one("#inp-source", Input).value.strip()
@@ -616,11 +729,11 @@ class Convert2RawApp(App):
 
         def _progress(msg: str) -> None:
             il = self.query_one(f"#{log_id}", RichLog)
-            self.call_from_thread(il.write, msg)
+            self._call_on_ui_thread(il.write, msg)
 
         def _do_download() -> None:
             ok, msg = install_tool(entry, progress_cb=_progress)
-            self.call_from_thread(
+            self._call_on_ui_thread(
                 self.query_one(f"#{status_id}", Static).update,
                 self._tool_status_text(tool, idx),
             )
@@ -658,6 +771,13 @@ class Convert2RawApp(App):
         msconvert_ver_idx = self._selected_index("rs-msconvert-ver")
 
         do_fix = (self._selected_index("rs-fix")) == 0
+
+        ppm_dev_raw = self.query_one("#inp-ppm-dev", Input).value.strip()
+        try:
+            ppm_dev = float(ppm_dev_raw) if ppm_dev_raw else 1.0
+        except ValueError:
+            self._log("[yellow]WARNING: Invalid ppm tolerance, using default 1.0.[/yellow]")
+            ppm_dev = 1.0
 
         newext_raw = self.query_one("#inp-newext", Input).value.strip()
         newext = newext_raw if newext_raw else "::SAME"
@@ -728,6 +848,9 @@ class Convert2RawApp(App):
             self._log("[yellow]Use the Download button to install it first.[/yellow]")
             return
 
+        # Remember these settings for next time the app is opened
+        save_settings(self._gather_settings())
+
         log_widget = self.query_one("#log", RichLog)
         log_widget.clear()
         log_widget.write("[bold green]Starting conversion...[/bold green]")
@@ -742,7 +865,7 @@ class Convert2RawApp(App):
                 display_name = str(rf.relative_to(raw_data_folder))
             except ValueError:
                 display_name = rf.name
-            row_cells = [display_name] + [Text(pending_symbol, style=pending_style) for _ in STEPS]
+            row_cells = [display_name] + [Text(pending_symbol, style=pending_style) for _ in STEPS] + [Text("—", style=pending_style)]
             table.add_row(*row_cells, key=str(rf))
 
         # Show and reset progress bar
@@ -762,7 +885,7 @@ class Convert2RawApp(App):
                     converter=converter,
                     do_fix=do_fix,
                     newext=newext,
-                    ppm_dev=1.0,
+                    ppm_dev=ppm_dev,
                     skip_existing=skip_existing,
                     n_threads=n_threads,
                     thermo_version_idx=thermo_ver_idx,
@@ -773,6 +896,7 @@ class Convert2RawApp(App):
                     log_callback=self._log,
                     progress_callback=self._update_progress,
                     status_callback=self._status_update,
+                    duration_callback=self._duration_update,
                 )
             except Exception as exc:
                 self._log(f"[red]ERROR: Conversion failed: {exc}[/red]")

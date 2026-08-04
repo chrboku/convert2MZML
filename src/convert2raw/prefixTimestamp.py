@@ -6,6 +6,8 @@ YYYY_MM_DD_HH_MM__ prefix.
 import re
 from pathlib import Path
 
+from .logutil import log_line
+
 
 # Regex to find startTimeStamp inside the <run …> opening tag without loading
 # the whole file into an XML parser (faster for large mzML files).
@@ -58,15 +60,9 @@ def rename_mzml_with_timestamp(mzml_file: Path, position: str = "prefix", log: l
     Appends messages to *log* (or prints directly when *log* is None).
     """
 
-    def _log(msg: str) -> None:
-        if log is None:
-            print(msg)
-        else:
-            log.append(msg)
-
     ts = extract_start_timestamp(mzml_file)
     if ts is None:
-        _log(f"  WARNING: No startTimeStamp found in '{mzml_file.name}', skipping rename.")
+        log_line(log, f"  WARNING: No startTimeStamp found in '{mzml_file.name}', skipping rename.")
         return None
 
     ts_str = get_timestamp_str(ts, position)
@@ -78,9 +74,9 @@ def rename_mzml_with_timestamp(mzml_file: Path, position: str = "prefix", log: l
     new_path = mzml_file.parent / new_name
 
     if new_path.exists():
-        _log(f"  WARNING: Target already exists, skipping rename: {new_path.name}")
+        log_line(log, f"  WARNING: Target already exists, skipping rename: {new_path.name}")
         return new_path
 
     mzml_file.rename(new_path)
-    _log(f"  Renamed: {mzml_file.name}  ->  {new_path.name}")
+    log_line(log, f"  Renamed: {mzml_file.name}  ->  {new_path.name}")
     return new_path

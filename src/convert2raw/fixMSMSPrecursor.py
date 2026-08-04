@@ -6,13 +6,14 @@
 # ///
 
 import bs4
-import re
 from os import listdir
 from os.path import isfile, join
 import argparse
 
+from .logutil import log_line
 
-def commentWrongPrecursorInfo(file, newFileExtension=""):
+
+def commentWrongPrecursorInfo(file, newFileExtension="", log=None):
     ## Reading data from the xml file
     with open(file, "r") as f:
         data = f.read()
@@ -30,19 +31,13 @@ def commentWrongPrecursorInfo(file, newFileExtension=""):
         toDel.append(tag)
         tag.decompose()
         # tag.replace_with(bs4.Comment(str(tag)))
-    print("      .. commented %d precursor information tags (selected ion m/z)" % (len(toDel)))
+    log_line(log, "      .. commented %d precursor information tags (selected ion m/z)" % (len(toDel)))
 
     with open(file.replace(".mzML", "%s.mzML" % (newFileExtension)), "w", newline="\n") as fout:
-        fout.write(
-            re.sub(
-                "<binary>\\s*(.*)\\s*</binary>",
-                "<binary>\\1</binary>",
-                bs_data.prettify().replace("\r", ""),
-            )
-        )
+        fout.write(str(bs_data))
 
 
-def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0):
+def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0, log=None):
     ## Reading data from the xml file
     with open(file, "r") as f:
         data = f.read()
@@ -50,8 +45,10 @@ def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0):
     ## Parse XML
     bs_data = bs4.BeautifulSoup(data, "xml")
 
+    totalMSMSScans = 0
     changedMSMSScans = 0
     for tag in bs_data.find_all("precursor"):
+        totalMSMSScans += 1
         ## incorrect MS:1000744
         selMZ = tag.find_all(
             name="cvParam",
@@ -78,25 +75,23 @@ def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0):
             isoMZV = float(isoMZ[0]["value"])
 
             if abs(selMZV - isoMZV) / isoMZV * 1e6 >= ppm_dev:
-                print("      .. incorrect 'selected ion m/z' %.5f, correcting to 'isolation window target m/z' %.5f" % (selMZV, isoMZV))
+                log_line(log, "      .. incorrect 'selected ion m/z' %.5f, correcting to 'isolation window target m/z' %.5f" % (selMZV, isoMZV))
                 selMZ[0]["value"] = isoMZV
                 changedMSMSScans += 1
         else:
             raise RuntimeError("There are 0 or more than 1 tag of 'selected ion m/z' or 'isolation window target m/z' for the tag: '%s'" % (tag))
 
-    print("      .. corrected %d precursor information tags ('selected ion m/z' replaced with 'isolation window target m/z')" % (changedMSMSScans))
+    log_line(
+        log,
+        "      .. %d MS2 spectra present, %d precursor information tag(s) corrected ('selected ion m/z' replaced with 'isolation window target m/z')"
+        % (totalMSMSScans, changedMSMSScans),
+    )
 
     output_file = file
     if new_file_suffix != "" and new_file_suffix != "::SAME":
         output_file = file.replace(".mzML", "%s.mzML" % (new_file_suffix))
     with open(output_file, "w", newline="\n") as fout:
-        fout.write(
-            re.sub(
-                "<binary>\\s*(.*)\\s*</binary>",
-                "<binary>\\1</binary>",
-                bs_data.prettify().replace("\r", ""),
-            )
-        )
+        fout.write(str(bs_data))
 
 
 if __name__ == "__main__":

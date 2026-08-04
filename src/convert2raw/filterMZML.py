@@ -13,6 +13,8 @@ from pathlib import Path
 
 import bs4
 
+from .logutil import log_line
+
 # ---------------------------------------------------------------------------
 # CV accession constants
 # ---------------------------------------------------------------------------
@@ -131,36 +133,18 @@ def _spectrum_matches(spectrum: bs4.Tag, f: MzmlFilter) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def apply_mzml_filter(mzml_file: Path, f: MzmlFilter, log: list[str] | None = None) -> None:
-    """Filter spectra in *mzml_file* in-place according to *f*.
+def _filter_soup(soup: bs4.BeautifulSoup, f: MzmlFilter) -> tuple[int, int]:
+    """Remove spectra from *soup* that do not satisfy *f*, in place.
 
-    Spectra that do not satisfy all active criteria are removed.
-    The ``count`` attribute of ``<spectrumList>`` and the ``index``
-    attributes of remaining spectra are updated accordingly.
-    The ``<indexList>`` (byte-offset index) is removed because byte
-    offsets are invalidated by the re-serialisation; all major mzML
+    Returns (kept, removed). The ``count`` attribute of ``<spectrumList>``
+    and the ``index`` attributes of remaining spectra are updated
+    accordingly. The ``<indexList>`` (byte-offset index) is removed because
+    byte offsets are invalidated by the re-serialisation; all major mzML
     readers fall back to linear scanning when the index is absent.
     """
-    if not f.is_active():
-        return
-
-    def _log(msg: str) -> None:
-        if log is None:
-            print(msg)
-        else:
-            log.append(msg)
-
-    _log(f"  Filtering spectra: {mzml_file.name}")
-
-    with open(mzml_file, "r", encoding="utf-8") as fh:
-        data = fh.read()
-
-    soup = bs4.BeautifulSoup(data, "xml")
-
     spectrum_list = soup.find("spectrumList")
     if spectrum_list is None:
-        _log("  WARNING: No <spectrumList> found, skipping filter.")
-        return
+        return 0, 0
 
     spectra = spectrum_list.find_all("spectrum", recursive=False)
     kept = 0
@@ -175,7 +159,6 @@ def apply_mzml_filter(mzml_file: Path, f: MzmlFilter, log: list[str] | None = No
 
     spectrum_list["count"] = str(kept)
 
-    # Remove the byte-offset index — it is invalidated by the rewrite
     index_list = soup.find("indexList")
     if index_list is not None:
         index_list.decompose()
@@ -186,23 +169,43 @@ def apply_mzml_filter(mzml_file: Path, f: MzmlFilter, log: list[str] | None = No
     if file_checksum is not None:
         file_checksum.decompose()
 
-    _log(f"  Filter result: kept {kept}, removed {removed} spectrum/spectra.")
-
-    with open(mzml_file, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(
-            re.sub(
-                "<binary>\\s*(.*)\\s*</binary>",
-                "<binary>\\1</binary>",
-                soup.prettify().replace("\r", ""),
-            )
-        )
+    return kept, removed
 
 
-def get_spectrum_polarities(mzml_file: Path) -> set[str]:
-    """Return the set of scan polarities present in *mzml_file*."""
+def filter_text(data: str, f: MzmlFilter) -> tuple[str, int, int]:
+    """Parse mzML *data*, apply *f*, and return (filtered_text, kept, removed)."""
+    soup = bs4.BeautifulSoup(data, "xml")
+    kept, removed = _filter_soup(soup, f)
+    return str(soup), kept, removed
+
+
+def write_text_to_file(text: str, out_path: Path) -> None:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def apply_mzml_filter(mzml_file: Path, f: MzmlFilter, log: list[str] | None = None) -> str:
+    """Filter spectra in *mzml_file* in-place according to *f*.
+
+    Returns the resulting mzML text (identical to what was written to
+    disk), so callers that need it downstream (e.g. polarity classification)
+    can reuse it without re-reading and re-parsing the file.
+    """
     with open(mzml_file, "r", encoding="utf-8") as fh:
         data = fh.read()
 
+    if not f.is_active():
+        return data
+
+    log_line(log, f"  Filtering spectra: {mzml_file.name}")
+    text, kept, removed = filter_text(data, f)
+    log_line(log, f"  Filter result: kept {kept}, removed {removed} spectrum/spectra.")
+    write_text_to_file(text, mzml_file)
+    return text
+
+
+def get_spectrum_polarities_from_text(data: str) -> set[str]:
+    """Return the set of scan polarities present in already-read mzML *data*."""
     soup = bs4.BeautifulSoup(data, "xml")
     spectrum_list = soup.find("spectrumList")
     if spectrum_list is None:
@@ -215,3 +218,10 @@ def get_spectrum_polarities(mzml_file: Path) -> set[str]:
         if spectrum.find("cvParam", {"accession": _CV_NEGATIVE_SCAN}):
             polarities.add("negative")
     return polarities
+
+
+def get_spectrum_polarities(mzml_file: Path) -> set[str]:
+    """Return the set of scan polarities present in *mzml_file*."""
+    with open(mzml_file, "r", encoding="utf-8") as fh:
+        data = fh.read()
+    return get_spectrum_polarities_from_text(data)

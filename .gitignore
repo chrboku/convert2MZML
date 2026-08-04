@@ -8,3 +8,6 @@ sw
 # test data
 testRaw
 testmzML
+
+# per-user local settings
+convert2raw_settings.json

@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import queue as queue_module
 import shutil
@@ -5,16 +6,24 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
+import tomllib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
-import toml
-
-from .filterMZML import MzmlFilter, apply_mzml_filter, get_spectrum_polarities  # noqa: E402
+from .filterMZML import (  # noqa: E402
+    MzmlFilter,
+    apply_mzml_filter,
+    filter_text,
+    get_spectrum_polarities,
+    get_spectrum_polarities_from_text,
+    write_text_to_file,
+)
 from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
+from .logutil import log_line as log_append  # noqa: E402
 from .prefixTimestamp import rename_mzml_with_timestamp  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -97,6 +106,7 @@ STEP_CLASSIFY = "Classify"
 STEPS: list[str] = [STEP_CONVERT, STEP_FIX, STEP_TIMESTAMP, STEP_FILTER, STEP_CLASSIFY]
 
 StatusCallback = Callable[[str, str, str], None]
+DurationCallback = Callable[[str, float], None]
 
 # Visual separators used to bracket each pipeline step in the per-file log
 STEP_SEP = "=" * 79
@@ -110,11 +120,43 @@ def _step_footer(step: str, status: str) -> list[str]:
     return [STEP_SEP, f"STEP END:   {step}  ({status})", STEP_SEP]
 
 
-def log_append(log: list[str] | None, msg: str) -> None:
-    if log is None:
-        print(msg)
-    else:
-        log.append(msg)
+class _StreamingLog(list):
+    """A list that also streams each appended (already-timestamped) line to
+    *event_queue*, if given. All pipeline modules append to the same
+    instance via log_append()/log_line(), so every message - not just the
+    step start/end markers - reaches the live TUI log as well as the
+    per-file .log file."""
+
+    def __init__(self, event_queue: "multiprocessing.queues.Queue | None") -> None:
+        super().__init__()
+        self._event_queue = event_queue
+
+    def append(self, msg: str) -> None:
+        super().append(msg)
+        if self._event_queue is not None:
+            self._event_queue.put(("log", msg))
+
+
+# ---------------------------------------------------------------------------
+# Settings persistence (remembers last-used TUI values between runs)
+# ---------------------------------------------------------------------------
+SETTINGS_PATH = SCRIPT_DIR / "convert2raw_settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +305,7 @@ def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float, log: list[st
     log_append(log, f"  Fixing MSMS precursors: {mzml_file.name}")
     suffix = "" if new_file_suffix == "::SAME" else new_file_suffix
     try:
-        correctWrongPrecursorInfo(str(mzml_file), new_file_suffix=suffix, ppm_dev=ppm_dev)
+        correctWrongPrecursorInfo(str(mzml_file), new_file_suffix=suffix, ppm_dev=ppm_dev, log=log)
     except Exception as exc:
         log_append(log, f"  WARNING: MSMS fix failed for '{mzml_file.name}': {exc}")
         return mzml_file, False
@@ -277,11 +319,15 @@ def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float, log: list[st
     return mzml_file, True
 
 
-def route_outputs(job: dict, mzml_file: Path, polarities: set[str], log: list[str] | None = None) -> Path:
+def route_outputs(job: dict, mzml_file: Path, polarities: set[str], mzml_text: str, log: list[str] | None = None) -> Path:
     """
     Classify the converted mzML by polarity content and produce Pos/Neg copies.
     The primary file (FPS folder, or the in-place file next to the raw file) is
     always kept in place — nothing is ever deleted or moved away from it.
+
+    *mzml_text* is the already-read content of *mzml_file* (reused from the
+    classify step) so that splitting a mixed-polarity file does not require
+    re-reading and re-parsing it from disk for each polarity.
     """
     output_mode: str = job.get("output_mode", "dedicated")
 
@@ -310,10 +356,10 @@ def route_outputs(job: dict, mzml_file: Path, polarities: set[str], log: list[st
     elif polarities == {"positive", "negative"}:
         pos_file = _pos_target()
         neg_file = _neg_target()
-        shutil.copy2(mzml_file, pos_file)
-        shutil.copy2(mzml_file, neg_file)
-        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
-        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
+        pos_text, _, _ = filter_text(mzml_text, MzmlFilter(polarity="positive"))
+        neg_text, _, _ = filter_text(mzml_text, MzmlFilter(polarity="negative"))
+        write_text_to_file(pos_text, pos_file)
+        write_text_to_file(neg_text, neg_file)
         log_append(log, f"  Split mixed-polarity file into Pos and Neg copies: {mzml_file.name}")
     else:
         log_append(log, "  WARNING: No polarity markers found after filtering.")
@@ -361,12 +407,11 @@ def process_job(job: dict, event_queue: "multiprocessing.queues.Queue | None" = 
     mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
     file_id = str(raw_file)
 
-    log: list[str] = []
+    log: list[str] = _StreamingLog(event_queue)
+    start_time = time.monotonic()
 
     def _emit(msg: str) -> None:
-        log.append(msg)
-        if event_queue is not None:
-            event_queue.put(("log", msg))
+        log_append(log, msg)
 
     def _status(step: str, status: str) -> None:
         if event_queue is not None:
@@ -424,14 +469,20 @@ def process_job(job: dict, event_queue: "multiprocessing.queues.Queue | None" = 
 
         if mzml_filter.is_active():
             _begin_step(STEP_FILTER)
-            apply_mzml_filter(mzml_file, mzml_filter, log=log)
+            mzml_text = apply_mzml_filter(mzml_file, mzml_filter, log=log)
             _end_step(STEP_FILTER, "success")
         else:
+            mzml_text = None
             _status(STEP_FILTER, "skipped")
 
         _begin_step(STEP_CLASSIFY)
-        polarities = get_spectrum_polarities(mzml_file)
-        mzml_file = route_outputs(job, mzml_file, polarities, log=log)
+        if mzml_text is None:
+            # Filter step didn't run (or was skipped), so this is the only
+            # full read/parse of the mzML needed for classification+split.
+            with open(mzml_file, "r", encoding="utf-8") as fh:
+                mzml_text = fh.read()
+        polarities = get_spectrum_polarities_from_text(mzml_text)
+        mzml_file = route_outputs(job, mzml_file, polarities, mzml_text, log=log)
         _end_step(STEP_CLASSIFY, "success" if polarities else "fail")
 
         _emit(f"[{label}] DONE:  {raw_file.name}")
@@ -441,6 +492,9 @@ def process_job(job: dict, event_queue: "multiprocessing.queues.Queue | None" = 
                 for line in log:
                     print(line)
     finally:
+        elapsed = time.monotonic() - start_time
+        if event_queue is not None:
+            event_queue.put(("duration", file_id, elapsed))
         _write_file_log(job, log)
 
 
@@ -553,6 +607,7 @@ def run_conversion(
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     status_callback: StatusCallback | None = None,
+    duration_callback: DurationCallback | None = None,
 ) -> None:
     """Execute the full conversion pipeline."""
 
@@ -636,6 +691,9 @@ def run_conversion(
             elif event[0] == "status" and status_callback:
                 _, file_id, step, status = event
                 status_callback(file_id, step, status)
+            elif event[0] == "duration" and duration_callback:
+                _, file_id, elapsed = event
+                duration_callback(file_id, elapsed)
 
     drain_thread = threading.Thread(target=_drain_events, daemon=True)
     drain_thread.start()
@@ -668,7 +726,8 @@ def run_conversion(
 
 def get_version() -> str:
     try:
-        return toml.load(SCRIPT_DIR / "pyproject.toml")["project"]["version"]
+        with open(SCRIPT_DIR / "pyproject.toml", "rb") as fh:
+            return tomllib.load(fh)["project"]["version"]
     except Exception:
         return "unknown"
 
