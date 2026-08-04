@@ -1,6 +1,6 @@
 [project]
 name = "convert2RAW"
-version = "4.2.1"
+version = "4.3.0"
 description = "Convert Thermo raw files and correct incorrect MSMS precursor information."
 readme = "README.md"
 requires-python = ">=3.13"

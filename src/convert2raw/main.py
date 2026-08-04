@@ -1,3 +1,5 @@
+import multiprocessing
+import queue as queue_module
 import shutil
 import subprocess
 import tarfile
@@ -82,6 +84,30 @@ def get_tool_paths(thermo_idx: int = 2, msconvert_idx: int = 0) -> tuple[Path, P
 
 SEP = "-" * 79
 _print_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Per-file pipeline steps (columns of the status overview table)
+# ---------------------------------------------------------------------------
+STEP_CONVERT = "Convert"
+STEP_FIX = "Fix MSMS"
+STEP_TIMESTAMP = "Timestamp"
+STEP_FILTER = "Filter"
+STEP_CLASSIFY = "Classify"
+STEPS: list[str] = [STEP_CONVERT, STEP_FIX, STEP_TIMESTAMP, STEP_FILTER, STEP_CLASSIFY]
+
+StatusCallback = Callable[[str, str, str], None]
+
+# Visual separators used to bracket each pipeline step in the per-file log
+STEP_SEP = "=" * 79
+
+
+def _step_header(step: str, file_name: str) -> list[str]:
+    return ["", "", "", STEP_SEP, f"STEP START: {step}  |  {file_name}", STEP_SEP]
+
+
+def _step_footer(step: str, status: str) -> list[str]:
+    return [STEP_SEP, f"STEP END:   {step}  ({status})", STEP_SEP]
 
 
 def log_append(log: list[str] | None, msg: str) -> None:
@@ -195,7 +221,7 @@ def _mode_dir_for(job: dict, mode_subdir: str) -> Path:
     return output_folder / mode_subdir / rel_parent
 
 
-def convert_thermo(raw_file: Path, out_dir: Path, thermoconvert: Path, log: list[str] | None = None) -> None:
+def convert_thermo(raw_file: Path, out_dir: Path, thermoconvert: Path, log: list[str] | None = None) -> bool:
     ensure_dir(out_dir)
     cmd = [str(thermoconvert), "-f", "1", "-a", "-e", "-x", "-i", str(raw_file), "-o", str(out_dir)]
     log_append(log, f"  Converting (ThermoRawFileParser): {raw_file.name}")
@@ -206,9 +232,11 @@ def convert_thermo(raw_file: Path, out_dir: Path, thermoconvert: Path, log: list
         log_append(log, f"    {line}")
     if result.returncode != 0:
         log_append(log, f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
+        return False
+    return True
 
 
-def convert_msconvert(raw_file: Path, out_dir: Path, msconvert: Path, polarity_filter: str | None = None, log: list[str] | None = None) -> None:
+def convert_msconvert(raw_file: Path, out_dir: Path, msconvert: Path, polarity_filter: str | None = None, log: list[str] | None = None) -> bool:
     ensure_dir(out_dir)
     cmd = [str(msconvert), str(raw_file), "--mzML", "--zlib", "-v"]
     if polarity_filter:
@@ -223,34 +251,101 @@ def convert_msconvert(raw_file: Path, out_dir: Path, msconvert: Path, polarity_f
         log_append(log, f"    {line}")
     if result.returncode != 0:
         log_append(log, f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
+        return False
+    return True
 
 
-def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float, log: list[str] | None = None) -> Path:
-    """Fix MSMS precursors and return the (possibly renamed) output file path."""
+def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float, log: list[str] | None = None) -> tuple[Path, bool]:
+    """Fix MSMS precursors and return the (possibly renamed) output file path and success flag."""
     if not mzml_file.exists():
         log_append(log, f"  WARNING: Expected output file not found, skipping MSMS fix: {mzml_file}")
-        return mzml_file
+        return mzml_file, False
     log_append(log, f"  Fixing MSMS precursors: {mzml_file.name}")
     suffix = "" if new_file_suffix == "::SAME" else new_file_suffix
     try:
         correctWrongPrecursorInfo(str(mzml_file), new_file_suffix=suffix, ppm_dev=ppm_dev)
     except Exception as exc:
         log_append(log, f"  WARNING: MSMS fix failed for '{mzml_file.name}': {exc}")
-        return mzml_file
+        return mzml_file, False
     if suffix:
         new_path = mzml_file.parent / (mzml_file.stem + suffix + ".mzML")
         try:
             mzml_file.unlink()
         except Exception as exc:
             log_append(log, f"  WARNING: Could not remove original file '{mzml_file.name}': {exc}")
-        return new_path
+        return new_path, True
+    return mzml_file, True
+
+
+def route_outputs(job: dict, mzml_file: Path, polarities: set[str], log: list[str] | None = None) -> Path:
+    """
+    Classify the converted mzML by polarity content and produce Pos/Neg copies.
+    The primary file (FPS folder, or the in-place file next to the raw file) is
+    always kept in place — nothing is ever deleted or moved away from it.
+    """
+    output_mode: str = job.get("output_mode", "dedicated")
+
+    def _pos_target() -> Path:
+        if output_mode == "inplace":
+            return job["raw_file"].parent / f"{mzml_file.stem}_posOnly{mzml_file.suffix}"
+        d = _mode_dir_for(job, "Pos")
+        ensure_dir(d)
+        return d / mzml_file.name
+
+    def _neg_target() -> Path:
+        if output_mode == "inplace":
+            return job["raw_file"].parent / f"{mzml_file.stem}_negOnly{mzml_file.suffix}"
+        d = _mode_dir_for(job, "Neg")
+        ensure_dir(d)
+        return d / mzml_file.name
+
+    if polarities == {"positive"}:
+        target = _pos_target()
+        shutil.copy2(mzml_file, target)
+        log_append(log, f"  Copied positive-only output: {target.name}")
+    elif polarities == {"negative"}:
+        target = _neg_target()
+        shutil.copy2(mzml_file, target)
+        log_append(log, f"  Copied negative-only output: {target.name}")
+    elif polarities == {"positive", "negative"}:
+        pos_file = _pos_target()
+        neg_file = _neg_target()
+        shutil.copy2(mzml_file, pos_file)
+        shutil.copy2(mzml_file, neg_file)
+        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
+        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
+        log_append(log, f"  Split mixed-polarity file into Pos and Neg copies: {mzml_file.name}")
+    else:
+        log_append(log, "  WARNING: No polarity markers found after filtering.")
     return mzml_file
 
 
-def process_job(job: dict, log_callback: Callable[[str], None] | None = None) -> None:
+def _write_file_log(job: dict, log_lines: list[str]) -> None:
+    """Write the complete per-file conversion log.
+
+    In dedicated mode it goes to output_folder/logs/<raw_file_stem>.log; in
+    in-place mode it is written next to the raw/mzML file instead.
+    """
+    raw_file: Path = job["raw_file"]
+    if job.get("output_mode") == "inplace":
+        log_path = raw_file.parent / f"{raw_file.stem}.log"
+    else:
+        logs_dir: Path = job["output_folder"] / "logs"
+        ensure_dir(logs_dir)
+        log_path = logs_dir / f"{raw_file.stem}.log"
+    with open(log_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(log_lines) + "\n")
+
+
+def process_job(job: dict, event_queue: "multiprocessing.queues.Queue | None" = None) -> None:
     """
     Convert one raw file, optionally fix MSMS precursors, and optionally prefix
-    the output filename with the acquisition timestamp.  Thread-safe.
+    the output filename with the acquisition timestamp.
+
+    Runs in its own process (submitted via ProcessPoolExecutor) so that the
+    CPU-heavy XML steps (Fix MSMS / Filter / Classify) get a dedicated core
+    each instead of contending for the GIL. Log lines and step-status updates
+    are streamed back to the main process through *event_queue*.
     """
     raw_file: Path = job["raw_file"]
     out_dir: Path = job["out_dir"]
@@ -264,162 +359,89 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
     msconvert: Path = job["msconvert"]
     timestamp_mode: str | None = job.get("timestamp_mode", None)
     mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
+    file_id = str(raw_file)
 
     log: list[str] = []
 
     def _emit(msg: str) -> None:
         log.append(msg)
-        if log_callback:
-            log_callback(msg)
+        if event_queue is not None:
+            event_queue.put(("log", msg))
 
-    _emit(f"[{label}] START: {raw_file.name}")
+    def _status(step: str, status: str) -> None:
+        if event_queue is not None:
+            event_queue.put(("status", file_id, step, status))
 
-    if converter == "thermo":
-        convert_thermo(raw_file, out_dir, thermoconvert, log=log)
-    else:
-        convert_msconvert(raw_file, out_dir, msconvert, polarity_filter=polarity_filter, log=log)
+    def _begin_step(step: str) -> None:
+        for line in _step_header(step, raw_file.name):
+            _emit(line)
+        _status(step, "running")
 
-    mzml_file = out_dir / (raw_file.stem + ".mzML")
+    def _end_step(step: str, status: str) -> None:
+        for line in _step_footer(step, status):
+            _emit(line)
+        _status(step, status)
 
-    if do_fix:
-        mzml_file = fix_msms(mzml_file, newext, ppm_dev, log=log)
+    def _skip_remaining(from_step: str) -> None:
+        remaining = STEPS[STEPS.index(from_step) :]
+        for step in remaining:
+            _status(step, "skipped")
 
-    if timestamp_mode in ("prefix", "suffix"):
-        new_path = rename_mzml_with_timestamp(mzml_file, position=timestamp_mode, log=log)
-        if new_path:
-            mzml_file = new_path
+    try:
+        _emit(f"[{label}] START: {raw_file.name}")
 
-    if mzml_filter.is_active():
-        apply_mzml_filter(mzml_file, mzml_filter, log=log)
+        _begin_step(STEP_CONVERT)
+        if converter == "thermo":
+            ok = convert_thermo(raw_file, out_dir, thermoconvert, log=log)
+        else:
+            ok = convert_msconvert(raw_file, out_dir, msconvert, polarity_filter=polarity_filter, log=log)
 
-    polarities = get_spectrum_polarities(mzml_file)
-    if polarities == {"positive"}:
-        target_dir = _mode_dir_for(job, "Pos")
-        ensure_dir(target_dir)
-        target_file = target_dir / mzml_file.name
-        shutil.move(str(mzml_file), str(target_file))
-        mzml_file = target_file
-        _emit(f"  Routed to Pos folder: {mzml_file.name}")
-    elif polarities == {"negative"}:
-        target_dir = _mode_dir_for(job, "Neg")
-        ensure_dir(target_dir)
-        target_file = target_dir / mzml_file.name
-        shutil.move(str(mzml_file), str(target_file))
-        mzml_file = target_file
-        _emit(f"  Routed to Neg folder: {mzml_file.name}")
-    elif polarities == {"positive", "negative"}:
-        fps_dir = _mode_dir_for(job, "FPS")
-        ensure_dir(fps_dir)
-        if mzml_file.parent != fps_dir:
-            target_file = fps_dir / mzml_file.name
-            shutil.move(str(mzml_file), str(target_file))
-            mzml_file = target_file
-        pos_dir = _mode_dir_for(job, "Pos")
-        neg_dir = _mode_dir_for(job, "Neg")
-        ensure_dir(pos_dir)
-        ensure_dir(neg_dir)
+        mzml_file = out_dir / (raw_file.stem + ".mzML")
+        if not ok or not mzml_file.exists():
+            _end_step(STEP_CONVERT, "fail")
+            _emit(f"[{label}] FAILED: {raw_file.name} (no output produced)")
+            _skip_remaining(STEP_FIX)
+            return
+        _end_step(STEP_CONVERT, "success")
 
-        pos_file = pos_dir / mzml_file.name
-        neg_file = neg_dir / mzml_file.name
-        shutil.copy2(mzml_file, pos_file)
-        shutil.copy2(mzml_file, neg_file)
-        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
-        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
-        _emit(f"  Split mixed-polarity file into FPS, Pos, and Neg folders: {mzml_file.name}")
-    else:
-        _emit("  WARNING: No polarity markers found after filtering; keeping FPS output.")
+        if do_fix:
+            _begin_step(STEP_FIX)
+            mzml_file, fix_ok = fix_msms(mzml_file, newext, ppm_dev, log=log)
+            _end_step(STEP_FIX, "success" if fix_ok else "fail")
+        else:
+            _status(STEP_FIX, "skipped")
 
-    _emit(f"[{label}] DONE:  {raw_file.name}")
+        if timestamp_mode in ("prefix", "suffix"):
+            _begin_step(STEP_TIMESTAMP)
+            new_path = rename_mzml_with_timestamp(mzml_file, position=timestamp_mode, log=log)
+            if new_path:
+                mzml_file = new_path
+                _end_step(STEP_TIMESTAMP, "success")
+            else:
+                _end_step(STEP_TIMESTAMP, "fail")
+        else:
+            _status(STEP_TIMESTAMP, "skipped")
 
-    if not log_callback:
-        with _print_lock:
-            for line in log:
-                print(line)
+        if mzml_filter.is_active():
+            _begin_step(STEP_FILTER)
+            apply_mzml_filter(mzml_file, mzml_filter, log=log)
+            _end_step(STEP_FILTER, "success")
+        else:
+            _status(STEP_FILTER, "skipped")
 
+        _begin_step(STEP_CLASSIFY)
+        polarities = get_spectrum_polarities(mzml_file)
+        mzml_file = route_outputs(job, mzml_file, polarities, log=log)
+        _end_step(STEP_CLASSIFY, "success" if polarities else "fail")
 
-def process_job_worker(job: dict) -> list[str]:
-    """
-    Worker version of process_job suitable for running in a separate process.
-    Returns a list of log lines produced while processing the job.
-    """
-    raw_file: Path = job["raw_file"]
-    out_dir: Path = job["out_dir"]
-    converter: str = job["converter"]
-    polarity_filter: str | None = job.get("polarity_filter")
-    do_fix: bool = job["fix"]
-    newext: str = job["newext"]
-    ppm_dev: float = job["ppm_dev"]
-    label: str = job["label"]
-    thermoconvert: Path = job["thermoconvert"]
-    msconvert: Path = job["msconvert"]
-    timestamp_mode: str | None = job.get("timestamp_mode", None)
-    mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
+        _emit(f"[{label}] DONE:  {raw_file.name}")
 
-    log: list[str] = []
-
-    def _emit(msg: str) -> None:
-        log.append(msg)
-
-    _emit(f"[{label}] START: {raw_file.name}")
-
-    if converter == "thermo":
-        convert_thermo(raw_file, out_dir, thermoconvert, log=log)
-    else:
-        convert_msconvert(raw_file, out_dir, msconvert, polarity_filter=polarity_filter, log=log)
-
-    mzml_file = out_dir / (raw_file.stem + ".mzML")
-
-    if do_fix:
-        mzml_file = fix_msms(mzml_file, newext, ppm_dev, log=log)
-
-    if timestamp_mode in ("prefix", "suffix"):
-        new_path = rename_mzml_with_timestamp(mzml_file, position=timestamp_mode, log=log)
-        if new_path:
-            mzml_file = new_path
-
-    if mzml_filter.is_active():
-        apply_mzml_filter(mzml_file, mzml_filter, log=log)
-
-    polarities = get_spectrum_polarities(mzml_file)
-    if polarities == {"positive"}:
-        target_dir = _mode_dir_for(job, "Pos")
-        ensure_dir(target_dir)
-        target_file = target_dir / mzml_file.name
-        shutil.move(str(mzml_file), str(target_file))
-        mzml_file = target_file
-        _emit(f"  Routed to Pos folder: {mzml_file.name}")
-    elif polarities == {"negative"}:
-        target_dir = _mode_dir_for(job, "Neg")
-        ensure_dir(target_dir)
-        target_file = target_dir / mzml_file.name
-        shutil.move(str(mzml_file), str(target_file))
-        mzml_file = target_file
-        _emit(f"  Routed to Neg folder: {mzml_file.name}")
-    elif polarities == {"positive", "negative"}:
-        fps_dir = _mode_dir_for(job, "FPS")
-        ensure_dir(fps_dir)
-        if mzml_file.parent != fps_dir:
-            target_file = fps_dir / mzml_file.name
-            shutil.move(str(mzml_file), str(target_file))
-            mzml_file = target_file
-        pos_dir = _mode_dir_for(job, "Pos")
-        neg_dir = _mode_dir_for(job, "Neg")
-        ensure_dir(pos_dir)
-        ensure_dir(neg_dir)
-
-        pos_file = pos_dir / mzml_file.name
-        neg_file = neg_dir / mzml_file.name
-        shutil.copy2(mzml_file, pos_file)
-        shutil.copy2(mzml_file, neg_file)
-        apply_mzml_filter(pos_file, MzmlFilter(polarity="positive"), log=log)
-        apply_mzml_filter(neg_file, MzmlFilter(polarity="negative"), log=log)
-        _emit(f"  Split mixed-polarity file into FPS, Pos, and Neg folders: {mzml_file.name}")
-    else:
-        _emit("  WARNING: No polarity markers found after filtering; keeping FPS output.")
-
-    _emit(f"[{label}] DONE:  {raw_file.name}")
-
-    return log
+        if event_queue is None:
+            with _print_lock:
+                for line in log:
+                    print(line)
+    finally:
+        _write_file_log(job, log)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +461,7 @@ def build_jobs(
     msconvert: Path,
     timestamp_mode: str | None = None,
     mzml_filter: MzmlFilter | None = None,
+    output_mode: str = "dedicated",
 ) -> list[dict]:
     jobs: list[dict] = []
     common = dict(
@@ -451,10 +474,14 @@ def build_jobs(
         mzml_filter=mzml_filter or MzmlFilter(),
         raw_data_folder=raw_data_folder,
         output_folder=output_folder,
+        output_mode=output_mode,
     )
 
     for raw_file in raw_files:
-        out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
+        if output_mode == "inplace":
+            out_dir = raw_file.parent
+        else:
+            out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
         jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter=converter, polarity_filter=None, label="FPS", **common))
 
     return jobs
@@ -463,42 +490,41 @@ def build_jobs(
 def filter_existing_jobs(jobs: list[dict]) -> tuple[list[dict], int]:
     """Return (remaining_jobs, n_skipped) based on whether the output mzML exists."""
 
-    def _output_mzml(job: dict) -> Path:
+    def _final_stem(job: dict) -> str:
         stem = job["raw_file"].stem
         if job["fix"] and job["newext"] != "::SAME":
-            return job["out_dir"] / (stem + job["newext"] + ".mzML")
-        return job["out_dir"] / (stem + ".mzML")
+            stem += job["newext"]
+        return stem
+
+    def _fps_path(job: dict) -> Path:
+        stem = _final_stem(job)
+        if job["output_mode"] == "inplace":
+            return job["raw_file"].parent / f"{stem}.mzML"
+        return job["out_dir"] / f"{stem}.mzML"
+
+    def _pos_path(job: dict, name: str) -> Path:
+        if job["output_mode"] == "inplace":
+            return job["raw_file"].parent / f"{Path(name).stem}_posOnly.mzML"
+        return _mode_dir_for(job, "Pos") / name
+
+    def _neg_path(job: dict, name: str) -> Path:
+        if job["output_mode"] == "inplace":
+            return job["raw_file"].parent / f"{Path(name).stem}_negOnly.mzML"
+        return _mode_dir_for(job, "Neg") / name
 
     def _job_complete(job: dict) -> bool:
-        primary_file = _output_mzml(job)
-        output_folder: Path = job["output_folder"]
-        raw_data_folder: Path = job["raw_data_folder"]
-        rel_parent = job["raw_file"].relative_to(raw_data_folder).parent
-        secondary_name = primary_file.name
-        fps_file = primary_file
-        if fps_file.exists():
-            polarities = get_spectrum_polarities(fps_file)
-            pos_file = output_folder / "Pos" / rel_parent / secondary_name
-            neg_file = output_folder / "Neg" / rel_parent / secondary_name
-            if polarities == {"positive", "negative"}:
-                return pos_file.exists() and neg_file.exists()
-            if polarities == {"positive"}:
-                return pos_file.exists()
-            if polarities == {"negative"}:
-                return neg_file.exists()
-            return True
-
-        pos_file = output_folder / "Pos" / rel_parent / secondary_name
-        neg_file = output_folder / "Neg" / rel_parent / secondary_name
-        if pos_file.exists():
-            if neg_file.exists():
-                return False
-            return get_spectrum_polarities(pos_file) == {"positive"}
-        if neg_file.exists():
-            if pos_file.exists():
-                return False
-            return get_spectrum_polarities(neg_file) == {"negative"}
-        return False
+        fps_file = _fps_path(job)
+        if not fps_file.exists():
+            return False
+        polarities = get_spectrum_polarities(fps_file)
+        name = fps_file.name
+        if polarities == {"positive", "negative"}:
+            return _pos_path(job, name).exists() and _neg_path(job, name).exists()
+        if polarities == {"positive"}:
+            return _pos_path(job, name).exists()
+        if polarities == {"negative"}:
+            return _neg_path(job, name).exists()
+        return True
 
     remaining = [j for j in jobs if not _job_complete(j)]
     return remaining, len(jobs) - len(remaining)
@@ -523,8 +549,10 @@ def run_conversion(
     msconvert_version_idx: int,
     timestamp_mode: str | None = None,
     mzml_filter: MzmlFilter | None = None,
+    output_mode: str = "dedicated",
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    status_callback: StatusCallback | None = None,
 ) -> None:
     """Execute the full conversion pipeline."""
 
@@ -568,6 +596,7 @@ def run_conversion(
         msconvert=msconvert,
         timestamp_mode=timestamp_mode,
         mzml_filter=mzml_filter,
+        output_mode=output_mode,
     )
 
     if skip_existing:
@@ -585,27 +614,49 @@ def run_conversion(
     completed_count = 0
     lock = threading.Lock()
 
+    # Worker processes cannot call back into this (main) process directly, so
+    # step/log events are streamed through a manager queue and drained here by
+    # a background thread. Running each job in its own process (rather than a
+    # thread) avoids GIL contention during the CPU-heavy Fix/Filter/Classify
+    # steps, which previously serialized onto a single core.
+    manager = multiprocessing.Manager()
+    event_queue = manager.Queue()
+    stop_draining = threading.Event()
+
+    def _drain_events() -> None:
+        while True:
+            try:
+                event = event_queue.get(timeout=0.2)
+            except queue_module.Empty:
+                if stop_draining.is_set():
+                    return
+                continue
+            if event[0] == "log":
+                _log(event[1])
+            elif event[0] == "status" and status_callback:
+                _, file_id, step, status = event
+                status_callback(file_id, step, status)
+
+    drain_thread = threading.Thread(target=_drain_events, daemon=True)
+    drain_thread.start()
+
     with ProcessPoolExecutor(max_workers=n_threads) as executor:
-        futures = {executor.submit(process_job_worker, job): job for job in jobs}
+        futures = {executor.submit(process_job, job, event_queue): job for job in jobs}
         for future in as_completed(futures):
             job = futures[future]
             try:
-                logs = future.result()
+                future.result()
             except Exception as exc:
-                logs = [f"  ERROR: Job for '{job['raw_file'].name}' failed: {exc}"]
+                _log(f"  ERROR: Job for '{job['raw_file'].name}' failed: {exc}")
             with lock:
                 completed_count += 1
                 done = completed_count
-                if log_callback:
-                    for line in logs:
-                        log_callback(line)
-                else:
-                    with _print_lock:
-                        for line in logs:
-                            print(line)
                 _log(f"Progress: {done}/{total} done")
                 if progress_callback:
                     progress_callback(done, total)
+
+    stop_draining.set()
+    drain_thread.join()
 
     _log("All done.")
 

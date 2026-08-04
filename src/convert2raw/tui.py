@@ -9,12 +9,14 @@ import os
 import threading
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import (
     Button,
     Checkbox,
+    DataTable,
     Footer,
     Header,
     Input,
@@ -30,6 +32,7 @@ from textual.widgets import (
 from .main import (
     MSCONVERT_VERSIONS,
     SCRIPT_DIR,
+    STEPS,
     THERMOCONVERT_VERSIONS,
     collect_raw_files,
     get_tool_paths,
@@ -38,6 +41,17 @@ from .main import (
     run_conversion,
 )
 from .filterMZML import MzmlFilter
+
+# ---------------------------------------------------------------------------
+# Status-table styling
+# ---------------------------------------------------------------------------
+_STATUS_STYLE: dict[str, tuple[str, str]] = {
+    "pending": ("—", "grey58"),
+    "running": ("…", "yellow"),
+    "success": ("✔", "green"),
+    "fail": ("✘", "red"),
+    "skipped": ("–", "grey42"),
+}
 
 # ---------------------------------------------------------------------------
 # CSS
@@ -137,6 +151,12 @@ Input:focus {
 
 #log {
     height: 20;
+    border: solid $primary;
+    margin: 1 0;
+}
+
+#status-table {
+    height: 30;
     border: solid $primary;
     margin: 1 0;
 }
@@ -298,8 +318,12 @@ class Convert2RawApp(App):
                 yield Input(placeholder="e.g. C:\\data\\raw", id="inp-source", value="..\\")
                 yield Button("🔍 Scan", id="btn-scan", variant="default")
             yield RichLog(id="scan-log", highlight=True, markup=True, wrap=True, classes="inline-log")
-            yield Label("Output folder (mzML files will be written here):")
+            yield Label("Output folder (mzML files will be written here; also used for the per-file logs):")
             yield Input(placeholder="e.g. C:\\data\\mzMLs", id="inp-output", value="..\\mzMLs")
+            yield Static("mzML file placement:", classes="hint")
+            with RadioSet(id="rs-outmode"):
+                yield RadioButton("Dedicated output folder (FPS / Pos / Neg subfolders)  [default]", value=True, id="rb-outmode-dedicated")
+                yield RadioButton("Place next to the raw file (_posOnly / _negOnly suffixes)", id="rb-outmode-inplace")
             yield Rule()
 
             # ----------------------------------------------------------------
@@ -431,6 +455,12 @@ class Convert2RawApp(App):
             yield Static("📋  Log", classes="section-title")
             yield RichLog(id="log", highlight=True, markup=True, wrap=True)
 
+            # ----------------------------------------------------------------
+            # Per-file status overview
+            # ----------------------------------------------------------------
+            yield Static("📊  File Status Overview", classes="section-title")
+            yield DataTable(id="status-table", zebra_stripes=True)
+
     def on_mount(self) -> None:
         # Hide scan log and progress bar until needed
         self.query_one("#scan-log", RichLog).display = False
@@ -438,6 +468,10 @@ class Convert2RawApp(App):
         self.query_one("#progress-label", Static).display = False
         # Apply initial visibility: ThermoRawFileParser selected by default
         self._apply_converter_visibility(is_thermo=True)
+        # Set up the status-overview table columns (File + one per pipeline step)
+        table = self.query_one("#status-table", DataTable)
+        col_keys = table.add_columns("File", *STEPS)
+        self._status_columns: dict[str, object] = dict(zip(["File"] + STEPS, col_keys))
 
     # ------------------------------------------------------------------
     # Helpers
@@ -468,6 +502,20 @@ class Convert2RawApp(App):
     def _log(self, msg: str) -> None:
         log_widget = self.query_one("#log", RichLog)
         self.call_from_thread(log_widget.write, msg)
+
+    def _status_update(self, file_id: str, step: str, status: str) -> None:
+        def _apply() -> None:
+            table = self.query_one("#status-table", DataTable)
+            col_key = self._status_columns.get(step)
+            if col_key is None:
+                return
+            symbol, style = _STATUS_STYLE.get(status, ("?", "white"))
+            try:
+                table.update_cell(file_id, col_key, Text(symbol, style=style))
+            except Exception:
+                pass
+
+        self.call_from_thread(_apply)
 
     def _apply_converter_visibility(self, is_thermo: bool) -> None:
         self.query_one("#panel-thermo-ver").display = is_thermo
@@ -601,6 +649,7 @@ class Convert2RawApp(App):
 
         recursive = self._selected_index("rs-recursive") == 0
         skip_existing = self._selected_index("rs-existing") == 0
+        output_mode = "dedicated" if self._selected_index("rs-outmode") == 0 else "inplace"
 
         conv_idx = self._selected_index("rs-converter")
         converter = "thermo" if conv_idx == 0 else "msconvert"
@@ -683,6 +732,19 @@ class Convert2RawApp(App):
         log_widget.clear()
         log_widget.write("[bold green]Starting conversion...[/bold green]")
 
+        # Populate the status-overview table: one row per input file, pending in every step
+        raw_files = collect_raw_files(raw_data_folder, recursive)
+        table = self.query_one("#status-table", DataTable)
+        table.clear()
+        pending_symbol, pending_style = _STATUS_STYLE["pending"]
+        for rf in raw_files:
+            try:
+                display_name = str(rf.relative_to(raw_data_folder))
+            except ValueError:
+                display_name = rf.name
+            row_cells = [display_name] + [Text(pending_symbol, style=pending_style) for _ in STEPS]
+            table.add_row(*row_cells, key=str(rf))
+
         # Show and reset progress bar
         bar = self.query_one("#progress-bar", ProgressBar)
         label = self.query_one("#progress-label", Static)
@@ -707,8 +769,10 @@ class Convert2RawApp(App):
                     msconvert_version_idx=msconvert_ver_idx,
                     timestamp_mode=timestamp_mode,
                     mzml_filter=mzml_filter,
+                    output_mode=output_mode,
                     log_callback=self._log,
                     progress_callback=self._update_progress,
+                    status_callback=self._status_update,
                 )
             except Exception as exc:
                 self._log(f"[red]ERROR: Conversion failed: {exc}[/red]")
